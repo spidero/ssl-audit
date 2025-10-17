@@ -21,12 +21,26 @@ It checks supported TLS versions, certificate details, HTTP headers (HSTS), OCSP
 ---
 
 ## 🧩 Usage
+```bash
+usage: ssl-audit.py [-h] [--port PORT] [--self-test] [host]
+
+TLS/HTTPS audit (mini SSL Labs)
+
+positional arguments:
+  host         Domain or host to test
+
+options:
+  -h, --help   show this help message and exit
+  --port PORT  Port number (default: 443)
+  --self-test  Run internal self-tests without network
+```
 
 ### Local run
 ```bash
-python ssl_audit.py example.com --port 443
-
+python ssl_audit.py example.com 
+```
 ### Docker
 ```bash
 docker build -t ssl-audit .
-docker run --rm ssl-audit example.com --port 443
+docker run --rm ssl-audit example.com 
+```
