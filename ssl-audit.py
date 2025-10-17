@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import print_function, annotations
 """
-SSL Audit – report similar to SSL Labs
-Author: Zdzichu (for Piotr)
+SSL Audit – minimal TLS/HTTPS scanner (inspired by SSL Labs style)
 
 Usage:
   python ssl_audit.py example.com --port 443
-  python ssl_audit.py --self-test
 
 Optional dependencies (for richer report):
   pip install cryptography pyopenssl dnspython httpx
@@ -83,6 +81,9 @@ class Report:
     caa: List[str] = field(default_factory=list)
     weak_dhe_supported: Optional[bool] = None
     strong_ecdhe_supported: Optional[bool] = None
+    # Enumerated ciphers per TLS version
+    tls12_ciphers: List[str] = field(default_factory=list)
+    tls13_ciphers: List[str] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
 
     def add(self, level: str, msg: str):
@@ -96,7 +97,6 @@ def resolve_ip(host: str) -> str:
         if fam == socket.AF_INET:
             return sa[0]
     return infos[0][4][0]
-
 
 def try_handshake(host: str, port: int,
                   minver: 'ssl.TLSVersion', maxver: 'ssl.TLSVersion',
@@ -124,8 +124,8 @@ def try_handshake(host: str, port: int,
     except Exception:
         return False, None
 
-
 def fetch_http_headers(host: str, port: int) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Simple GET / to capture response headers (HTTP/1.1)."""
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((host, port), timeout=6) as sock:
@@ -158,14 +158,14 @@ def fetch_http_headers(host: str, port: int) -> Tuple[Optional[int], Optional[st
             k, _, v = line.partition(":")
             if not v:
                 continue
-            if k.lower() == "server":
+            lk = k.lower()
+            if lk == "server":
                 server = v.strip()
-            if k.lower() == "strict-transport-security":
+            if lk == "strict-transport-security":
                 hsts = v.strip()
         return status, server, hsts
     except Exception:
         return None, None, None
-
 
 def parse_cert_with_stdlib(host: str, port: int) -> Tuple[Optional[dict], Optional[bytes]]:
     try:
@@ -178,15 +178,16 @@ def parse_cert_with_stdlib(host: str, port: int) -> Tuple[Optional[dict], Option
     except Exception:
         return None, None
 
-
 def enrich_cert_with_crypto(rep: Report, der: bytes):
     if not x509 or not der:
         return
     cert = x509.load_der_x509_certificate(der)
+    # signature
     try:
         rep.cert_sig_alg = cert.signature_hash_algorithm.name  # type: ignore[attr-defined]
     except Exception:
         rep.cert_sig_alg = None
+    # public key
     try:
         pub = cert.public_key()
         if rsa and isinstance(pub, rsa.RSAPublicKey):  # type: ignore[attr-defined]
@@ -197,7 +198,6 @@ def enrich_cert_with_crypto(rep: Report, der: bytes):
             rep.cert_pubkey = pub.__class__.__name__
     except Exception:
         rep.cert_pubkey = None
-
 
 def get_chain_and_ocsp_with_pyopenssl(host: str, port: int) -> Tuple[Optional[int], Optional[bool]]:
     if not OpenSSL:
@@ -230,7 +230,6 @@ def get_chain_and_ocsp_with_pyopenssl(host: str, port: int) -> Tuple[Optional[in
     except Exception:
         return None, None
 
-
 def query_caa(host: str) -> List[str]:
     out: List[str] = []
     if dns is None:
@@ -252,6 +251,69 @@ def query_caa(host: str) -> List[str]:
                 continue
     return out
 
+# ---------------- Cipher enumeration ----------------
+
+# Reasonable TLS 1.2 cipher candidates (extend as needed)
+TLS12_CANDIDATES = [
+    # AEAD GCM suites
+    'ECDHE-ECDSA-AES256-GCM-SHA384',
+    'ECDHE-ECDSA-AES128-GCM-SHA256',
+    'ECDHE-RSA-AES256-GCM-SHA384',
+    'ECDHE-RSA-AES128-GCM-SHA256',
+    # ChaCha20 (if OpenSSL supports)
+    'ECDHE-ECDSA-CHACHA20-POLY1305',
+    'ECDHE-RSA-CHACHA20-POLY1305',
+    # CBC fallbacks (not recommended, but checked)
+    'ECDHE-RSA-AES256-SHA384',
+    'ECDHE-RSA-AES128-SHA256',
+]
+
+# TLS 1.3 cipher candidates (names per RFC; controlled via set_ciphersuites)
+TLS13_CANDIDATES = [
+    'TLS_AES_256_GCM_SHA384',
+    'TLS_AES_128_GCM_SHA256',
+    'TLS_CHACHA20_POLY1305_SHA256',
+]
+
+def enumerate_ciphers(host: str, port: int) -> tuple[list[str], list[str]]:
+    """Probe which ciphers the server accepts for TLS 1.2 and TLS 1.3.
+    Returns (tls12_supported, tls13_supported)."""
+    tls12_ok: list[str] = []
+    tls13_ok: list[str] = []
+
+    # TLS 1.2: force a single cipher each time
+    for name in TLS12_CANDIDATES:
+        ok, _ = try_handshake(host, port,
+                              ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2,
+                              ciphers=name)
+        if ok:
+            tls12_ok.append(name)
+
+    # TLS 1.3: prefer limiting via set_ciphersuites, else record negotiated
+    try:
+        for name in TLS13_CANDIDATES:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                ctx.set_ciphersuites(name)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                with socket.create_connection((host, port), timeout=5) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        sel = ssock.cipher()  # (name, proto, bits)
+                        if sel and sel[0] and sel[0] not in tls13_ok:
+                            tls13_ok.append(sel[0])
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return tls12_ok, tls13_ok
+
 # ---------------- Runner ----------------
 
 def run(host: str, port: int) -> Report:
@@ -261,6 +323,7 @@ def run(host: str, port: int) -> Report:
     except Exception:
         rep.ip = None
 
+    # TLS versions support tests
     tests = [
         ('TLS1.0', ssl.TLSVersion.TLSv1),
         ('TLS1.1', ssl.TLSVersion.TLSv1_1),
@@ -272,6 +335,7 @@ def run(host: str, port: int) -> Report:
         if ok:
             rep.tls_versions.append(name)
 
+    # ALPN probing
     for proto in ['h2', 'http/1.1']:
         ok, selected = try_handshake(host, port,
                                      ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.MAXIMUM_SUPPORTED,
@@ -279,6 +343,7 @@ def run(host: str, port: int) -> Report:
         if ok and selected == proto:
             rep.alpn.append(proto)
 
+    # HTTP/2 validation (if httpx present)
     if httpx is not None and 'h2' in rep.alpn:
         try:
             with httpx.Client(http2=True, verify=True, timeout=5.0) as client:
@@ -287,10 +352,13 @@ def run(host: str, port: int) -> Report:
         except Exception:
             rep.http2_ok = False
 
+    # Headers
     rep.status_code, rep.server_header, rep.hsts = fetch_http_headers(host, port)
 
+    # Certificate (stdlib)
     cert_dict, der = parse_cert_with_stdlib(host, port)
     if cert_dict:
+        # subject CN
         subj = cert_dict.get('subject', ())
         cn = None
         for rdn in subj:
@@ -298,8 +366,10 @@ def run(host: str, port: int) -> Report:
                 if k == 'commonName':
                     cn = v
         rep.cert_subject = cn
+        # SAN
         san = cert_dict.get('subjectAltName', ())
         rep.cert_san = [v for (t, v) in san if t == 'DNS']
+        # issuer
         iss = cert_dict.get('issuer', ())
         issuer_cn = None
         for rdn in iss:
@@ -307,6 +377,7 @@ def run(host: str, port: int) -> Report:
                 if k == 'commonName':
                     issuer_cn = v
         rep.cert_issuer = issuer_cn
+        # validity
         try:
             from datetime import datetime
             fmt = '%b %d %H:%M:%S %Y %Z'
@@ -318,9 +389,13 @@ def run(host: str, port: int) -> Report:
     if der:
         enrich_cert_with_crypto(rep, der)
 
+    # Chain & OCSP (pyOpenSSL)
     rep.chain_len, rep.ocsp_stapling = get_chain_and_ocsp_with_pyopenssl(host, port)
+
+    # CAA
     rep.caa = query_caa(host)
 
+    # Cipher spot checks
     weak_dhe = 'DHE-RSA-AES256-SHA'
     ok, _ = try_handshake(host, port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2, ciphers=weak_dhe)
     rep.weak_dhe_supported = ok
@@ -328,6 +403,9 @@ def run(host: str, port: int) -> Report:
     strong = 'ECDHE-RSA-AES128-GCM-SHA256'
     ok, _ = try_handshake(host, port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2, ciphers=strong)
     rep.strong_ecdhe_supported = ok
+
+    # Full cipher enumeration (always collected now)
+    rep.tls12_ciphers, rep.tls13_ciphers = enumerate_ciphers(host, port)
 
     return rep
 
@@ -342,6 +420,10 @@ def print_report(rep: Report):
     print(f"  TLS versions: {', '.join(rep.tls_versions) or 'none'}")
     print(f"  ALPN: {', '.join(rep.alpn) or 'none'}  | HTTP/2 supported: {rep.http2_ok}")
     print(f"  Weak DHE accepted: {rep.weak_dhe_supported} | Strong ECDHE accepted: {rep.strong_ecdhe_supported}")
+    if rep.tls12_ciphers:
+        print(f"  TLS 1.2 ciphers accepted ({len(rep.tls12_ciphers)}): {', '.join(rep.tls12_ciphers)}")
+    if rep.tls13_ciphers:
+        print(f"  TLS 1.3 ciphers accepted ({len(rep.tls13_ciphers)}): {', '.join(rep.tls13_ciphers)}")
     print()
 
     print("[HTTP]")
