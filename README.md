@@ -4,7 +4,6 @@ SSL/HTTPS Audit – report similar to SSL Labs
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Build](https://img.shields.io/badge/build-passing-success.svg)]()
 
 A lightweight Python tool for scanning HTTPS/TLS configuration — similar in spirit to SSL Labs, but fast and self-hosted.  
 It checks supported TLS versions, certificate details, HTTP headers (HSTS), OCSP stapling, ALPN/HTTP2, and CAA records.
